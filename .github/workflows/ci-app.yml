@@ -1,10 +1,7 @@
 name: CI (app)
 
-<<<<<<< Updated upstream
-=======
 # CI pipeline для Rollwar/wiki-v2 (форк requarks/wiki-v2).
 #
->>>>>>> Stashed changes
 # Ключевая особенность этой версии:
 #   - lint и security scan объединены в один job (lint-security)
 #   - оба шага non-blocking: continue-on-error + warning в логе
