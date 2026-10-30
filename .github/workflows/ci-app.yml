@@ -503,7 +503,7 @@ jobs:
                   ]
                   + (if ($lint_text | length) > 0 then
                     [{type: "divider"},
-                     {type: "section", text: {type: "mrkdwn", text: ("*Lint issues (truncated):*\n```\n" + $lint_text + "\n```"}}]
+                     {type: "section", text: {type: "mrkdwn", text: ("*Lint issues (truncated):*\n```\n" + $lint_text + "\n```")}}]
                   else [] end)
                   + (if ($vuln_text | length) > 0 then
                     [{type: "divider"},
