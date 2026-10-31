@@ -340,7 +340,7 @@ jobs:
 
           # Use gh CLI — обходит deprecated API + не падает на data.id
           gh workflow run cd.yml \
-            --repo Rollwar/cicd-wikijs \
+            --repo Rollwar/cicd-wiki \
             --ref main \
             -f image_tag="$IMAGE_TAG" \
             -f image_digest="$IMAGE_DIGEST" \
@@ -351,7 +351,7 @@ jobs:
           echo "✓ CD workflow dispatched to $ENVIRONMENT"
           echo "  Image: ghcr.io/rollwar/wiki@$IMAGE_TAG"
           echo "  Source SHA: $SOURCE_SHA"
-          echo "  Track at: https://github.com/Rollwar/cicd-wikijs/actions/workflows/cd.yml"
+          echo "  Track at: https://github.com/Rollwar/cicd-wiki/actions/workflows/cd.yml"
 
   # ── Final: notification ───────────────────────────────────────────────────
   notify:
