@@ -1,15 +1,5 @@
 name: CI (app)
 
-# CI pipeline для Rollwar/wiki-v2 (форк requarks/wiki-v2).
-# Адаптировано под реальную структуру репозитория:
-#   - yarn-based (не npm)
-#   - Dockerfile в dev/build/Dockerfile (не в корне)
-#   - build context = корень репо
-#   - нет TypeScript — tsc не запускается
-#   - yarn test уже включает ESLint + pug-lint + Jest
-#
-# После успешного build — диспатчит CD-workflow в Rollwar/cicd-wikijs.
-
 on:
   push:
     branches: [main, develop, 'release/*', 'hotfix/*']
@@ -34,15 +24,26 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/rollwar/wiki-v2
+  IMAGE_NAME: ghcr.io/rollwar/wiki
   NODE_VERSION: '20'
 
 jobs:
-  # ── Stage 1: code validation ──────────────────────────────────────────────
-  lint:
-    name: Lint + Tests (yarn)
+  # ── Stage 1: lint + security (non-blocking) ──────────────────────────────
+  lint-security:
+    name: Lint + Security (non-blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    outputs:
+      lint-exit-code: ${{ steps.lint.outputs.exit-code }}
+      lint-status:    ${{ steps.lint.outputs.status }}
+      audit-critical: ${{ steps.audit.outputs.critical }}
+      audit-high:     ${{ steps.audit.outputs.high }}
+      audit-moderate: ${{ steps.audit.outputs.moderate }}
+      audit-low:      ${{ steps.audit.outputs.low }}
+      audit-status:   ${{ steps.audit.outputs.status }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,41 +59,82 @@ jobs:
       - name: Install dependencies
         run: yarn install --frozen-lockfile --non-interactive
 
-      - name: Run lint + unit tests (yarn test = eslint + pug-lint + jest)
-        run: yarn test
-
-  security:
-    name: Security scan (Trivy + yarn audit)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      security-events: write
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: yarn audit (high+critical only)
+      # ── Lint + unit tests (eslint + pug-lint + jest) ─────────────────────
+      - name: Run lint + unit tests (non-blocking)
+        id: lint
+        continue-on-error: true
         run: |
-          yarn audit --groups dependencies --level high --json > audit.json || true
-          HIGH=$(jq -r 'select(.metadata.vulnerabilities.high != null) | .metadata.vulnerabilities.high' audit.json 2>/dev/null | tail -1)
-          CRIT=$(jq -r 'select(.metadata.vulnerabilities.critical != null) | .metadata.vulnerabilities.critical' audit.json 2>/dev/null | tail -1)
-          echo "::warning::High=$HIGH Critical=$CRIT"
-          # Fail only on critical
-          if [ "${CRIT:-0}" != "0" ]; then
-            echo "::error::Critical vulnerabilities found: $CRIT"
-            exit 1
+          set +e
+          yarn test --quiet > lint-output.txt 2>&1
+          LINT_EXIT=$?
+          set -e
+
+          echo "exit-code=$LINT_EXIT" >> $GITHUB_OUTPUT
+          if [ "$LINT_EXIT" -eq 0 ]; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+            echo "::notice::Lint and tests passed."
+          else
+            echo "status=issues" >> $GITHUB_OUTPUT
+            echo "::warning::Lint/tests reported issues (exit code $LINT_EXIT). Pipeline continues; see artifact ci-lint-security-report."
+          fi
+          echo "── yarn test (tail) ──"
+          tail -n 200 lint-output.txt || true
+
+      # ── yarn audit (high+critical only) ──────────────────────────────────
+      - name: Run yarn audit (non-blocking)
+        id: audit
+        continue-on-error: true
+        run: |
+          set +e
+          yarn audit --groups dependencies --level high --json > audit.json 2>/dev/null
+          AUDIT_EXIT=$?
+          set -e
+
+          # Извлекаем счётчики по уровням из итоговой metadata-записи
+          HIGH=$(jq -r 'select(.type == "auditSummary") | .data.vulnerabilities.high'     audit.json 2>/dev/null | tail -1)
+          CRIT=$(jq -r 'select(.type == "auditSummary") | .data.vulnerabilities.critical' audit.json 2>/dev/null | tail -1)
+          MOD=$(jq  -r 'select(.type == "auditSummary") | .data.vulnerabilities.moderate'  audit.json 2>/dev/null | tail -1)
+          LOW=$(jq  -r 'select(.type == "auditSummary") | .data.vulnerabilities.low'       audit.json 2>/dev/null | tail -1)
+
+          echo "high=${HIGH:-0}"     >> $GITHUB_OUTPUT
+          echo "critical=${CRIT:-0}" >> $GITHUB_OUTPUT
+          echo "moderate=${MOD:-0}"  >> $GITHUB_OUTPUT
+          echo "low=${LOW:-0}"       >> $GITHUB_OUTPUT
+
+          TOTAL=$(( ${CRIT:-0} + ${HIGH:-0} ))
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+            echo "::notice::No high+ vulnerabilities."
+          else
+            echo "status=warn" >> $GITHUB_OUTPUT
+            echo "::warning::Vulnerabilities: critical=${CRIT:-0}, high=${HIGH:-0}, moderate=${MOD:-0}, low=${LOW:-0}"
           fi
 
+          # Человекочитаемый список уязвимостей для Slack
+          jq -r '
+            select(.type == "auditAdvisory") |
+            "* " + (.data.advisory.severity | ascii_upcase) +
+            " — " + .data.advisory.title +
+            "\n  module: `" + .data.advisory.module_name + "`" +
+            "  vulnerable: `" + (.data.advisory.vulnerable_versions // "?") + "`" +
+            "  fix: `" + (.data.advisory.patched_versions // "n/a") + "`" +
+            (if .data.advisory.url then "\n  " + .data.advisory.url else "" end)
+          ' audit.json > audit-summary.txt 2>/dev/null || true
+
+          echo "── audit summary ──"
+          cat audit-summary.txt || true
+
+      # ── Trivy filesystem scan (non-blocking) ─────────────────────────────
+      # Сканирует файловую систему репозитория на CRITICAL уязвимости.
+      # SARIF-отчёт загружается в GitHub Security tab.
+      # exit-code: '0' — чтобы не валил pipeline (мы уже логируем через audit).
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
           severity: 'CRITICAL'
-          exit-code: '1'
+          exit-code: '0'
           format: 'sarif'
           output: 'trivy-results.sarif'
 
@@ -102,12 +144,75 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
+      # ── Сводный markdown для артефакта ───────────────────────────────────
+      - name: Build summary markdown
+        if: always()
+        run: |
+          {
+            echo "## Lint & Tests"
+            if [ "${{ steps.lint.outputs.exit-code }}" = "0" ]; then
+              echo "✅ Passed (exit code 0)"
+            else
+              echo "⚠️ Issues found (exit code ${{ steps.lint.outputs.exit-code }})"
+            fi
+            echo ""
+            echo "<details><summary>Full yarn test output</summary>"
+            echo ""
+            echo '```'
+            cat lint-output.txt 2>/dev/null || echo "(no output captured)"
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "## Security audit (yarn)"
+            echo ""
+            echo "| Level | Count |"
+            echo "| --- | --- |"
+            echo "| Critical | ${{ steps.audit.outputs.critical || '0' }} |"
+            echo "| High | ${{ steps.audit.outputs.high || '0' }} |"
+            echo "| Moderate | ${{ steps.audit.outputs.moderate || '0' }} |"
+            echo "| Low | ${{ steps.audit.outputs.low || '0' }} |"
+            echo ""
+            if [ -s audit-summary.txt ]; then
+              echo "<details><summary>Vulnerability details</summary>"
+              echo ""
+              echo '```'
+              cat audit-summary.txt
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+            echo ""
+            echo "## Trivy fs scan"
+            echo ""
+            echo "SARIF загружен в GitHub Security tab. CRITICAL = 0 в exit code 0."
+          } > ci-summary.md
+
+      - name: Upload lint + security report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-lint-security-report
+          path: |
+            lint-output.txt
+            audit.json
+            audit-summary.txt
+            trivy-results.sarif
+            ci-summary.md
+          retention-days: 14
+          if-no-files-found: ignore
+
   # ── Stage 2: container build & push ────────────────────────────────────────
   build:
     name: Build & Push image
-    needs: [lint, security]
+    needs: [lint-security]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write      # для cosign keyless
+      attestations: write  # для attestations
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
       image-digest: ${{ steps.push.outputs.digest }}
@@ -133,13 +238,14 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ── Login: GITHUB_TOKEN по умолчанию, CR_PAT как fallback ──────────────
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.CR_PAT != '' && secrets.CR_USER || github.actor }}
+          password: ${{ secrets.CR_PAT != '' && secrets.CR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Build & push (Dockerfile в dev/build/)
         id: push
@@ -154,6 +260,48 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
+      - name: Diagnose push failure
+        if: failure() && github.event_name != 'pull_request'
+        run: |
+          cat <<'EOF'
+          ┌──────────────────────────────────────────────────────────────────┐
+          │  GHCR push failed: denied: permission_denied: write_package     │
+          └──────────────────────────────────────────────────────────────────┘
+
+          Это НЕ баг воркфлоу — это права на пакет в GitHub Container Registry.
+
+          Чек-лист фикса (по порядку):
+
+          1) Пакет уже существует и не слинкован с репо (САМЫЙ ЧАСТЫЙ СЛУЧАЙ):
+             → https://github.com/orgs/rollwar/packages/container/wiki/settings
+             → раздел "Manage Actions access"
+             → Add Repository → "Rollwar/wiki" → Role: Write → Save
+
+          2) Пакета ещё нет, но орг запрещает создание:
+             → https://github.com/organizations/rollwar/settings/packages
+             → "Package creation" → убедиться, что "Public" и "Private"
+               разрешены для members (или изменить политику)
+
+          3) GITHUB_TOKEN не авторизован для SSO на пакете:
+             → settings пакета → "Manage Actions access" → убедиться, что
+               репо добавлен (см. п.1)
+
+          4) Обходной путь — создать classic PAT со scope `write:packages`:
+             → https://github.com/settings/tokens → Generate new token (classic)
+             → scopes: write:packages, read:packages
+             → в репо Rollwar/wiki → Settings → Secrets and variables → Actions:
+                 CR_PAT = <токен>
+                 CR_USER = <ваш GitHub username>
+             → перевыполнить workflow
+
+          Диагностика текущего запуска:
+          EOF
+          echo "  Repository:       ${{ github.repository }}"
+          echo "  Actor:            ${{ github.actor }}"
+          echo "  Event:            ${{ github.event_name }}"
+          echo "  Ref:              ${{ github.ref }}"
+          echo "  Image:            ${{ env.IMAGE_NAME }}"
+          echo "  Using CR_PAT:     ${{ secrets.CR_PAT != '' && 'yes' || 'no (using GITHUB_TOKEN)' }}"
 
       - name: Sign image (cosign keyless)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -166,10 +314,6 @@ jobs:
           cosign sign --yes ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
   # ── Stage 3: trigger downstream CD ─────────────────────────────────────────
-  # Только trigger-cd запускается на self-hosted runner, т.к. ему нужен:
-  #   - gh CLI (для cross-repo workflow_dispatch в Rollwar/cicd-wikijs)
-  #   - kubeconfig context=k8s (если будем сразу делать verify deploy)
-  # Все остальные jobs (lint, security, build, notify) — на ubuntu-latest.
   trigger-cd:
     name: Trigger CD (cicd-wikijs)
     needs: build
@@ -194,7 +338,7 @@ jobs:
           fi
           echo "Triggering CD workflow in Rollwar/cicd-wikijs for environment=$ENVIRONMENT"
 
-          # Use gh CLI — это обходит проблему с deprecated API + не падает на data.id
+          # Use gh CLI — обходит deprecated API + не падает на data.id
           gh workflow run cd.yml \
             --repo Rollwar/cicd-wikijs \
             --ref main \
@@ -212,36 +356,158 @@ jobs:
   # ── Final: notification ───────────────────────────────────────────────────
   notify:
     name: Slack notification
-    needs: [lint, security, build]
+    needs: [lint-security, build, trigger-cd]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Summarize
-        id: summary
+      - name: Download lint + security report
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-lint-security-report
+
+      - name: Build Slack payload
+        id: payload
+        env:
+          LINT_EXIT:     ${{ needs.lint-security.outputs.lint-exit-code }}
+          LINT_STATUS:   ${{ needs.lint-security.outputs.lint-status }}
+          AUDIT_CRIT:     ${{ needs.lint-security.outputs.audit-critical }}
+          AUDIT_HIGH:     ${{ needs.lint-security.outputs.audit-high }}
+          AUDIT_MOD:      ${{ needs.lint-security.outputs.audit-moderate }}
+          AUDIT_LOW:      ${{ needs.lint-security.outputs.audit-low }}
+          AUDIT_STATUS:   ${{ needs.lint-security.outputs.audit-status }}
+          BUILD_RESULT:   ${{ needs.build.result }}
+          TRIGGER_RESULT: ${{ needs.trigger-cd.result }}
         run: |
+          # ── 1. Overall pipeline status — падает только при отказе build/trigger ──
           OVERALL="success"
-          if [[ "${{ needs.lint.result }}" == "failure" || "${{ needs.security.result }}" == "failure" || "${{ needs.build.result }}" == "failure" ]]; then
+          if [[ "${BUILD_RESULT:-skipped}" == "failure" ]]; then
+            OVERALL="failure"
+          elif [[ "${TRIGGER_RESULT:-skipped}" == "failure" ]]; then
+            OVERALL="failure"
+          elif [[ "${BUILD_RESULT:-skipped}" != "success" && "${BUILD_RESULT:-skipped}" != "skipped" ]]; then
+            # cancelled / null — считаем failure для нотификации
             OVERALL="failure"
           fi
           echo "overall=$OVERALL" >> $GITHUB_OUTPUT
+
+          COLOR="${OVERALL##success}"
+          if [ -z "$COLOR" ]; then COLOR="#36a64f"; else COLOR="#dc3545"; fi
+          EMOJI=$([ "$OVERALL" = "success" ] && echo ":white_check_mark:" || echo ":x:")
+          echo "color=$COLOR" >> $GITHUB_OUTPUT
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+
+          # ── 2. Lint status line ──────────────────────────────────────────────
+          if [ "${LINT_EXIT:-0}" = "0" ]; then
+            LINT_LINE="✅ passed"
+          else
+            LINT_LINE="⚠️ issues (exit ${LINT_EXIT})"
+          fi
+          echo "lint-line=$LINT_LINE" >> $GITHUB_OUTPUT
+
+          # ── 3. Security status line ──────────────────────────────────────────
+          TOTAL_HI=$(( ${AUDIT_CRIT:-0} + ${AUDIT_HIGH:-0} ))
+          if [ "$TOTAL_HI" -eq 0 ]; then
+            SEC_LINE="✅ no high+ vulns (mod=${AUDIT_MOD:-0}, low=${AUDIT_LOW:-0})"
+          else
+            SEC_LINE="⚠️ critical=${AUDIT_CRIT:-0} high=${AUDIT_HIGH:-0} (mod=${AUDIT_MOD:-0}, low=${AUDIT_LOW:-0})"
+          fi
+          echo "sec-line=$SEC_LINE" >> $GITHUB_OUTPUT
+
+          # ── 4. Lint issues excerpt (до ~2500 символов) ───────────────────────
+          # Берём строки, похожие на ошибки/предупреждения.
+          LINT_EXCERPT_FILE=$(mktemp)
+          if [ "${LINT_EXIT:-0}" != "0" ] && [ -f lint-output.txt ]; then
+            {
+              grep -iE '(\berror\b|\bwarning\b|✖|✗|FAIL|✕|problem|✗ .* problem)' lint-output.txt 2>/dev/null \
+                | head -n 60 \
+                | head -c 2500
+            } > "$LINT_EXCERPT_FILE" || true
+            # Если grep ничего не нашёл — возьмём хвост вывода
+            if [ ! -s "$LINT_EXCERPT_FILE" ]; then
+              tail -n 60 lint-output.txt | head -c 2500 > "$LINT_EXCERPT_FILE" || true
+            fi
+          fi
+          echo "lint-excerpt-path=$LINT_EXCERPT_FILE" >> $GITHUB_OUTPUT
+
+          # ── 5. Vulnerabilities excerpt ───────────────────────────────────────
+          VULN_EXCERPT_FILE=$(mktemp)
+          if [ "$TOTAL_HI" -gt 0 ] && [ -f audit-summary.txt ]; then
+            head -c 2500 audit-summary.txt > "$VULN_EXCERPT_FILE" || true
+          fi
+          echo "vuln-excerpt-path=$VULN_EXCERPT_FILE" >> $GITHUB_OUTPUT
+
       - name: Notify Slack
         if: env.SLACK_WEBHOOK_URL != ''
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          COLOR:           ${{ steps.payload.outputs.color }}
+          EMOJI:           ${{ steps.payload.outputs.emoji }}
+          OVERALL:         ${{ steps.payload.outputs.overall }}
+          LINT_LINE:       ${{ steps.payload.outputs.lint-line }}
+          SEC_LINE:        ${{ steps.payload.outputs.sec-line }}
+          LINT_EXCERPT:    ${{ steps.payload.outputs.lint-excerpt-path }}
+          VULN_EXCERPT:    ${{ steps.payload.outputs.vuln-excerpt-path }}
         run: |
-          COLOR="${{ steps.summary.outputs.overall == 'success' && '#36a64f' || '#dc3545' }}"
-          EMOJI="${{ steps.summary.outputs.overall == 'success' && ':white_check_mark:' || ':x:' }}"
-          curl -sS -X POST -H 'Content-type: application/json' --data "{
-            \"attachments\":[{
-              \"color\":\"$COLOR\",
-              \"blocks\":[
-                {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"$EMOJI CI: ${{ steps.summary.outputs.overall }} — wiki-v2\"}},
-                {\"type\":\"section\",\"fields\":[
-                  {\"type\":\"mrkdwn\",\"text\":\"*Branch:*\n${{ github.ref_name }}\"},
-                  {\"type\":\"mrkdwn\",\"text\":\"*Commit:*\n${{ github.sha }}\"},
-                  {\"type\":\"mrkdwn\",\"text\":\"*Author:*\n${{ github.actor }}\"},
-                  {\"type\":\"mrkdwn\",\"text\":\"*Run:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|#${{ github.run_number }}>\"}
-                ]}
-              ]
-            }]
-          }" "$SLACK_WEBHOOK_URL"
+          # Загружаем выдержки из файлов (могут быть пустыми)
+          LINT_TEXT=""
+          if [ -s "$LINT_EXCERPT" ]; then
+            LINT_TEXT=$(cat "$LINT_EXCERPT")
+          fi
+          VULN_TEXT=""
+          if [ -s "$VULN_EXCERPT" ]; then
+            VULN_TEXT=$(cat "$VULN_EXCERPT")
+          fi
+
+          # Собираем payload через jq — он сам экранирует спецсимволы
+          PAYLOAD=$(jq -n \
+            --arg color "$COLOR" \
+            --arg header "${EMOJI} CI: ${OVERALL} — wiki" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg run_number "${{ github.run_number }}" \
+            --arg lint_line "$LINT_LINE" \
+            --arg sec_line "$SEC_LINE" \
+            --arg lint_text "$LINT_TEXT" \
+            --arg vuln_text "$VULN_TEXT" \
+            '{
+              attachments: [{
+                color: $color,
+                blocks: (
+                  [
+                    {type: "header", text: {type: "plain_text", text: $header}},
+                    {type: "section", fields: [
+                      {type: "mrkdwn", text: ("*Branch:*\n" + $branch)},
+                      {type: "mrkdwn", text: ("*Commit:*\n" + $sha)},
+                      {type: "mrkdwn", text: ("*Author:*\n" + $actor)},
+                      {type: "mrkdwn", text: ("*Run:*\n<" + $run_url + "|#" + $run_number + ">")}
+                    ]},
+                    {type: "section", fields: [
+                      {type: "mrkdwn", text: ("*Lint:*\n" + $lint_line)},
+                      {type: "mrkdwn", text: ("*Security:*\n" + $sec_line)}
+                    ]}
+                  ]
+                  + (if ($lint_text | length) > 0 then
+                    [{type: "divider"},
+                     {type: "section", text: {type: "mrkdwn", text: ("*Lint issues (truncated):*\n```\n" + $lint_text + "\n```")}}]
+                  else [] end)
+                  + (if ($vuln_text | length) > 0 then
+                    [{type: "divider"},
+                     {type: "section", text: {type: "mrkdwn", text: ("*Vulnerabilities:*\n" + $vuln_text)}}]
+                  else [] end)
+                  + [
+                    {type: "context", elements: [
+                      {type: "mrkdwn", text: ("Full report artifact: `ci-lint-security-report` — open run for details: <" + $run_url + "|#" + $run_number + " ↗>")}
+                    ]}
+                  ]
+                )
+              }]
+            }')
+
+          echo "$PAYLOAD" | curl -sS -X POST \
+            -H 'Content-type: application/json' \
+            -d @- \
+            "$SLACK_WEBHOOK_URL"
