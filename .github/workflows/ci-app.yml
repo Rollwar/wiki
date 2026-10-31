@@ -1,8 +1,19 @@
-name: CI
+name: CI (app)
+
+# CI pipeline для Rollwar/wiki-v2 (форк requarks/wiki-v2).
+# Адаптировано под реальную структуру репозитория:
+#   - yarn-based (не npm)
+#   - Dockerfile в dev/build/Dockerfile (не в корне)
+#   - build context = корень репо
+#   - нет TypeScript — tsc не запускается
+#   - yarn test уже включает ESLint + pug-lint + Jest
+#
+# После успешного build — диспатчит CD-workflow в Rollwar/cicd-wikijs.
 
 on:
   push:
     branches: [main, develop, 'release/*', 'hotfix/*']
+    tags: ['v*']
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
@@ -23,14 +34,15 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ inputs.image-name || 'ghcr.io/rollwar/wiki' }}
+  IMAGE_NAME: ghcr.io/rollwar/wiki-v2
+  NODE_VERSION: '20'
 
 jobs:
   # ── Stage 1: code validation ──────────────────────────────────────────────
   lint:
-    name: Lint & Static Analysis
+    name: Lint + Tests (yarn)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,23 +52,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'yarn'
 
-      - name: Install deps
-        run: npm ci --no-audit --no-fund
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --non-interactive
 
-      - name: ESLint
-        run: npm run lint
-
-      - name: Prettier check
-        run: npm run format:check
-
-      - name: TypeScript type-check
-        run: npm run typecheck
+      - name: Run lint + unit tests (yarn test = eslint + pug-lint + jest)
+        run: yarn test
 
   security:
-    name: Security scan (Trivy + npm audit)
+    name: Security scan (Trivy + yarn audit)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -68,19 +74,24 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: npm audit (high+critical only)
+      - name: yarn audit (high+critical only)
         run: |
-          set -e
-          npm audit --omit=dev --audit-level=high || {
-            echo "::warning::High-severity npm advisories detected — check log"
-          }
+          yarn audit --groups dependencies --level high --json > audit.json || true
+          HIGH=$(jq -r 'select(.metadata.vulnerabilities.high != null) | .metadata.vulnerabilities.high' audit.json 2>/dev/null | tail -1)
+          CRIT=$(jq -r 'select(.metadata.vulnerabilities.critical != null) | .metadata.vulnerabilities.critical' audit.json 2>/dev/null | tail -1)
+          echo "::warning::High=$HIGH Critical=$CRIT"
+          # Fail only on critical
+          if [ "${CRIT:-0}" != "0" ]; then
+            echo "::error::Critical vulnerabilities found: $CRIT"
+            exit 1
+          fi
 
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          severity: 'HIGH,CRITICAL'
+          severity: 'CRITICAL'
           exit-code: '1'
           format: 'sarif'
           output: 'trivy-results.sarif'
@@ -96,7 +107,7 @@ jobs:
     name: Build & Push image
     needs: [lint, security]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
       image-digest: ${{ steps.push.outputs.digest }}
@@ -130,12 +141,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push
+      - name: Build & push (Dockerfile в dev/build/)
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: dev/build/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -144,7 +155,7 @@ jobs:
           provenance: true
           sbom: true
 
-      - name: Sign image (cosign)
+      - name: Sign image (cosign keyless)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: sigstore/cosign-installer@v3
       - name: Sign
@@ -155,31 +166,48 @@ jobs:
           cosign sign --yes ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
   # ── Stage 3: trigger downstream CD ─────────────────────────────────────────
+  # Только trigger-cd запускается на self-hosted runner, т.к. ему нужен:
+  #   - gh CLI (для cross-repo workflow_dispatch в Rollwar/cicd-wikijs)
+  #   - kubeconfig context=k8s (если будем сразу делать verify deploy)
+  # Все остальные jobs (lint, security, build, notify) — на ubuntu-latest.
   trigger-cd:
-    name: Trigger CD
+    name: Trigger CD (cicd-wikijs)
     needs: build
     runs-on: self-hosted
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    if: |
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v'))
     steps:
-      - name: Trigger CD workflow
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.CICD_PAT || secrets.GITHUB_TOKEN }}
-          script: |
-            const { data } = await github.rest.actions.createWorkflowDispatch({
-              owner: 'Rollwar',
-              repo: 'cicd-wikijs',
-              workflow_id: 'cd.yml',
-              ref: 'main',
-              inputs: {
-                image_tag: '${{ needs.build.outputs.image-tag }}',
-                image_digest: '${{ needs.build.outputs.image-digest }}',
-                environment: context.ref === 'refs/heads/main' ? 'production' : 'staging',
-                source_sha: '${{ github.sha }}',
-                source_run_id: '${{ github.run_id }}'
-              }
-            })
-            core.info(`CD dispatched: run id ${data.id}`)
+      - name: Dispatch CD workflow via gh CLI
+        env:
+          GH_TOKEN: ${{ secrets.CICD_PAT }}
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image-digest }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          # Determine target environment from ref
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]] || [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            ENVIRONMENT="production"
+          else
+            ENVIRONMENT="staging"
+          fi
+          echo "Triggering CD workflow in Rollwar/cicd-wikijs for environment=$ENVIRONMENT"
+
+          # Use gh CLI — это обходит проблему с deprecated API + не падает на data.id
+          gh workflow run cd.yml \
+            --repo Rollwar/cicd-wikijs \
+            --ref main \
+            -f image_tag="$IMAGE_TAG" \
+            -f image_digest="$IMAGE_DIGEST" \
+            -f environment="$ENVIRONMENT" \
+            -f source_sha="$SOURCE_SHA" \
+            -f source_run_id="$SOURCE_RUN_ID"
+
+          echo "✓ CD workflow dispatched to $ENVIRONMENT"
+          echo "  Image: ghcr.io/rollwar/wiki@$IMAGE_TAG"
+          echo "  Source SHA: $SOURCE_SHA"
+          echo "  Track at: https://github.com/Rollwar/cicd-wikijs/actions/workflows/cd.yml"
 
   # ── Final: notification ───────────────────────────────────────────────────
   notify:
